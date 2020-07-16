@@ -17,10 +17,17 @@ import static org.talend.components.snowflake.tsnowflakeoutput.TSnowflakeOutputP
 import java.io.IOException;
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.text.DateFormat;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 
 import org.apache.avro.LogicalTypes;
 import org.apache.avro.Schema;
@@ -52,6 +59,8 @@ import net.snowflake.client.loader.LoaderProperty;
 import net.snowflake.client.loader.Operation;
 
 public class SnowflakeWriter implements WriterWithFeedback<Result, IndexedRecord, IndexedRecord> {
+
+    private final static Set<String> STRING_TYPES = new HashSet<>(Arrays.asList(new String[]{"STRING", "TEXT", "VARCHAR"}));
 
     protected Loader loader;
 
@@ -94,6 +103,10 @@ public class SnowflakeWriter implements WriterWithFeedback<Result, IndexedRecord
     private transient List<Schema.Field> remoteTableFields;
 
     private String emptyStringValue;
+
+    private Map<String, String> dbTypes= null;
+
+    private Map<String, DateFormat> dateFormats = new HashMap<>();
 
     @Override
     public Iterable<IndexedRecord> getSuccessfulWrites() {
@@ -187,10 +200,14 @@ public class SnowflakeWriter implements WriterWithFeedback<Result, IndexedRecord
     }
 
     private Map<String, String> getDbTypeMap() {
-        Map<String, String> dbTypeMap = new HashMap<>();
+        if(this.dbTypes != null){
+            return this.dbTypes;
+        }
 
+        Map<String, String> dbTypeMap = new HashMap<>();
         if (!sprops.usePersonalDBType.getValue()) {
-            return dbTypeMap;
+            this.dbTypes = dbTypeMap;
+            return this.dbTypes;
         }
 
         List<String> columns = sprops.dbtypeTable.column.getValue();
@@ -199,7 +216,8 @@ public class SnowflakeWriter implements WriterWithFeedback<Result, IndexedRecord
             dbTypeMap.put(columns.get(i), dbTypes.get(i));
         }
 
-        return dbTypeMap;
+        this.dbTypes = dbTypeMap;
+        return this.dbTypes;
     }
 
     private void execTableAction(Object datum) throws IOException {
@@ -355,6 +373,11 @@ public class SnowflakeWriter implements WriterWithFeedback<Result, IndexedRecord
             dbColumnName = isUpperCase ? dbColumnName.toUpperCase() : dbColumnName;
             Field runtimeField = dbColumnName2RuntimeField.get(dbColumnName);
 
+            final Optional<String> dateAsString = this.formatBySchemaDatePattern(field, inputValue);
+            if(dateAsString.isPresent()){
+                return dateAsString.get();
+            }
+
             if (runtimeField != null) {
                 s = AvroUtils.unwrapIfNullable(runtimeField.schema());
             } else {
@@ -362,15 +385,33 @@ public class SnowflakeWriter implements WriterWithFeedback<Result, IndexedRecord
             }
         }
 
-        return formatIfAnySnowflakeDateType(inputValue, s);
+        return formatIfAnySnowflakeDateType(inputValue, s, field);
+    }
+
+    private Optional<String> formatBySchemaDatePattern(Field field, Object inputValue){
+        final Map<String, String> dbTypeMap = this.getDbTypeMap();
+        final String dbType = dbTypeMap.get(field.name());
+        String dateAsString = null;
+
+        if(STRING_TYPES.contains(dbType)){
+            final String datePattern = field.getProp(SchemaConstants.TALEND_COLUMN_PATTERN);
+            DateFormat df = dateFormats.computeIfAbsent(datePattern, p -> new SimpleDateFormat(p));
+            dateAsString = df.format((Date)inputValue);
+        }
+
+        return Optional.ofNullable(dateAsString);
     }
 
     // only retrieve schema function or dynamic may support logical types below as it runtime to fetch the schema by
     // SnowflakeAvroRegistry
-    private Object formatIfAnySnowflakeDateType(Object inputValue, Schema s) {
+    private Object formatIfAnySnowflakeDateType(Object inputValue, Schema s, Field field) {
         if (LogicalTypes.fromSchemaIgnoreInvalid(s) == LogicalTypes.timeMillis()) {
             return formatter.formatTimeMillis(inputValue);
         } else if (LogicalTypes.fromSchemaIgnoreInvalid(s) == LogicalTypes.date()) {
+            final Optional<String> dateAsString = this.formatBySchemaDatePattern(field, inputValue);
+            if(dateAsString.isPresent()){
+                return dateAsString.get();
+            }
             return formatter.formatDate(inputValue);
         } else if (LogicalTypes.fromSchemaIgnoreInvalid(s) == LogicalTypes.timestampMillis()) {
             return formatter.formatTimestampMillis(inputValue);
